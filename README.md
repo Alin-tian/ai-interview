@@ -24,7 +24,8 @@ Docker 只运行 MySQL、Elasticsearch 和 Redis；FastAPI 与 Nuxt 在本机运
 - <img width="1909" height="775" alt="image" src="https://github.com/user-attachments/assets/d8560135-4677-4a18-bef6-20281b9f5d5f" />
   <img width="994" height="760" alt="image" src="https://github.com/user-attachments/assets/7e9ca10f-13f3-42df-bbe2-fb92ed626023" />
 - 通过可配置搜索 API 发现公开岗位/面试资料，或抓取用户提供的公开 URL；记录来源并缓存。
-- ![Uploading image.png…]()
+- <img width="1026" height="787" alt="image" src="https://github.com/user-attachments/assets/fbb00182-6ac7-4eab-b8ba-875e3469f0fc" />
+
 
 - 10 道主问题、每题最多 2 次追问；SSE 实时返回进度、题目、评分与总评。
 - 多维评分、面试历史、同一会话内不计分的自由问答。
