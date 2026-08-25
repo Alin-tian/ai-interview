@@ -29,6 +29,32 @@ async def acquire_answer_lock(session_id: int, turn_id: int) -> bool:
     finally:
         await client.aclose()
 
+async def release_answer_lock(session_id: int, turn_id: int) -> None:
+    client = await redis_client()
+    try:
+        try:
+            await client.delete(f"interview:answer:{session_id}:{turn_id}")
+        except Exception:
+            # The lock also has a short TTL; cleanup failure must not turn a
+            # successfully generated next question into an SSE failure.
+            pass
+    finally:
+        await client.aclose()
+
+async def delete_session_cache(session_id: int) -> None:
+    """Delete transient Redis locks scoped to an interview session."""
+    client = await redis_client()
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await client.scan(cursor=cursor, match=f"interview:answer:{session_id}:*", count=100)
+            if keys:
+                await client.delete(*keys)
+            if cursor == 0:
+                return
+    finally:
+        await client.aclose()
+
 async def check_redis() -> None:
     client = await redis_client()
     try:

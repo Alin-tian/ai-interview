@@ -1,5 +1,7 @@
+#异步上下文管理器，用于定义应用启动和关闭时的生命周期逻辑
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+# 允许前端访问后端接口。
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.models.database import init_db
@@ -8,6 +10,7 @@ from app.rag.material_retriever import retriever
 from app.services.cache import check_redis
 
 settings = get_settings()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,9 +22,18 @@ async def lifespan(app: FastAPI):
     await retriever.check_ready()
     yield
 
+
 app = FastAPI(title="AI Interview Agent", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.cors_origins.split(",")], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[x.strip() for x in settings.cors_origins.split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(interviews_router, prefix="/api/v1")
 
+
 @app.get("/api/v1/health")
-async def health(): return {"status": "ok", "service": "ai-interview-agent"}
+async def health():
+    return {"status": "ok", "service": "ai-interview-agent"}

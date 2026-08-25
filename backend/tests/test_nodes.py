@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import pytest
-from app.agents.nodes import fallback_question, fallback_evaluation, is_similar_question, plan_next
+from app.agents.nodes import fallback_question, fallback_evaluation, evaluate_answer, is_similar_question, plan_next
 
 
 def test_question_has_topic_and_source_refs():
@@ -13,6 +13,8 @@ def test_question_has_topic_and_source_refs():
 def test_evaluation_has_all_dimensions():
     evaluation = fallback_evaluation({"expected_points": ["取舍"]}, "我会比较方案并压测")
     assert set(evaluation["dimensions"]) == {"correctness", "completeness", "technical_depth", "project_experience", "expression", "engineering_risk_awareness"}
+    assert evaluation["standard_answer_short"]
+    assert evaluation["standard_answer_full"]
 
 
 def test_evaluation_accepts_llm_string_fields():
@@ -39,3 +41,17 @@ def test_fallback_score_uses_evidence_not_length_only():
     strong = fallback_evaluation(question, "在支付项目中我负责改造流程，首先分析失败率，其次增加监控和灰度验证，最终将失败率从 3% 降到 1%，并复盘风险边界。")
     assert strong["overall_score"] > weak["overall_score"]
     assert strong["evidence_found"]
+
+
+@pytest.mark.asyncio
+async def test_evaluation_normalises_malformed_model_fields(monkeypatch):
+    async def malformed_model(*_args):
+        return {"strengths": "有项目经验", "evidence_gaps": 3, "factual_errors": 0, "improvement_suggestion": 42}
+
+    monkeypatch.setattr("app.agents.nodes.ask_json", malformed_model)
+    result = await evaluate_answer({"expected_points": ["取舍"]}, "我负责项目并完成验证")
+
+    assert result["strengths"] == ["有项目经验"]
+    assert result["evidence_gaps"] == ["3"]
+    assert result["factual_errors"] == ["0"]
+    assert isinstance(result["improvement_suggestion"], str)

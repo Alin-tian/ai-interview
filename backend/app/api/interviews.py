@@ -1,16 +1,20 @@
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, desc
+from starlette.background import BackgroundTask
+from sqlalchemy import delete, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.database import get_db
-from app.models.interview import InterviewSession, InterviewTurn, InterviewQAMessage
+from app.models.interview import InterviewSession, InterviewSource, InterviewTurn, InterviewQAMessage
 from app.services.resume_parser import save_and_parse_pdf
 from app.services.interview_service import collect_sources, initialize, evaluate_turn, advance_interview, sources_for, source_dict, delete_session_files, retrieve_context
-from app.services.cache import acquire_answer_lock
+from app.services.cache import acquire_answer_lock, delete_session_cache, release_answer_lock
+from app.agents.nodes import plan_next
+from app.rag.material_retriever import retriever
 from app.utils.sse import event, node_enter, node_leave
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
@@ -89,33 +93,87 @@ async def submit_answer(session_id: int, payload: dict, db: AsyncSession = Depen
     if session.status == "completed":
         raise HTTPException(409, "本场面试已完成，不能继续提交回答")
     answer, turn_id = str(payload.get("answer", "")).strip(), payload.get("turn_id")
-    if not answer or not turn_id: raise HTTPException(422, "turn_id 和 answer 为必填项")
+    if not turn_id: raise HTTPException(422, "turn_id 为必填项")
     result = await db.execute(select(InterviewTurn).where(InterviewTurn.id == int(turn_id), InterviewTurn.session_id == session.id))
     turn = result.scalar_one_or_none()
-    if not turn or turn.answer: raise HTTPException(409, "题目不存在或已提交回答")
-    if not await acquire_answer_lock(session.id, turn.id):
+    if not turn: raise HTTPException(409, "题目不存在")
+    if turn.answer:
+        # Recovery path: evaluation may have committed before next-question
+        # generation failed. Reuse the persisted answer/evaluation.
+        later = (await db.execute(select(InterviewTurn).where(
+            InterviewTurn.session_id == session.id,
+            InterviewTurn.id > turn.id,
+        ).order_by(InterviewTurn.id))).scalars().first()
+        if later:
+            async def existing_stream():
+                yield event("question", serialize_turn(later))
+            return StreamingResponse(existing_stream(), media_type="text/event-stream")
+        answer = turn.answer
+        evaluation = turn.evaluation or {}
+        action = await plan_next(turn.question, evaluation, session.followups_for_round, session.current_round, session.max_rounds)
+        resume_only = True
+    else:
+        if not answer: raise HTTPException(422, "answer 为必填项")
+        resume_only = False
+    if not resume_only and not await acquire_answer_lock(session.id, turn.id):
         raise HTTPException(409, "该题正在处理，请勿重复提交")
     async def stream():
-        yield node_enter("answer_evaluator", "回答评估 Agent")
+        nonlocal evaluation, action
         try:
-            evaluation, action = await evaluate_turn(session, turn, answer, db)
-        except Exception as exc:
-            await db.rollback()
-            yield event("workflow_error", {"error": f"回答评估失败：{exc}"})
-            return
-        yield node_leave("answer_evaluator", "回答评估 Agent")
-        yield event("evaluation", {"turn_id": turn.id, "evaluation": evaluation})
-        yield node_enter("next_step", "生成下一题或面试总评")
-        try:
-            next_turn, review = await advance_interview(session, turn, action, db)
-        except Exception as exc:
-            await db.rollback()
-            yield event("workflow_error", {"error": f"后续面试流程失败：{exc}"})
-            return
-        yield node_leave("next_step", "生成下一题或面试总评")
-        if next_turn: yield event("question", serialize_turn(next_turn))
-        if review: yield event("interview_completed", review)
-    return StreamingResponse(stream(), media_type="text/event-stream")
+            if not resume_only:
+                yield node_enter("answer_evaluator", "回答评估 Agent")
+                evaluation_task = asyncio.create_task(evaluate_turn(session, turn, answer, db))
+                try:
+                    # Keep the SSE connection alive while the model is evaluating.
+                    # Browser/proxy idle timeouts otherwise surface as a misleading
+                    # `network error` even though the request is still progressing.
+                    while not evaluation_task.done():
+                        done, _ = await asyncio.wait({evaluation_task}, timeout=10)
+                        if not done:
+                            yield ": keep-alive\n\n"
+                    evaluation, action = await evaluation_task
+                except asyncio.CancelledError:
+                    # A disconnected browser must not cancel evaluation after the
+                    # answer has been accepted. Finish both persistence and the
+                    # next-step transition; a reopened historical session can then
+                    # continue from the generated question without resubmission.
+                    evaluation, action = await asyncio.shield(evaluation_task)
+                    try:
+                        await asyncio.shield(advance_interview(session, turn, action, db))
+                    except Exception:
+                        await db.rollback()
+                    return
+                except Exception as exc:
+                    await db.rollback()
+                    yield event("workflow_error", {"error": f"回答评估失败：{exc}"})
+                    return
+                yield node_leave("answer_evaluator", "回答评估 Agent")
+                # Include the accepted answer so the client can render the completed
+                # turn immediately, without waiting for next-question generation.
+                yield event("evaluation", {"turn_id": turn.id, "answer": answer, "evaluation": evaluation})
+            yield node_enter("next_step", "生成下一题或面试总评")
+            try:
+                next_turn, review = await advance_interview(session, turn, action, db)
+            except Exception as exc:
+                await db.rollback()
+                yield event("workflow_error", {"error": f"后续面试流程失败：{exc}"})
+                return
+            yield node_leave("next_step", "生成下一题或面试总评")
+            if next_turn: yield event("question", serialize_turn(next_turn))
+            if review: yield event("interview_completed", review)
+        finally:
+            # StreamingResponse can be cancelled when the browser disconnects.
+            # Cancellation is not an Exception on modern Python, so cleanup must
+            # live in finally or the Redis lock remains until its TTL expires.
+            if not resume_only:
+                await release_answer_lock(session.id, turn.id)
+    cleanup = None if resume_only else BackgroundTask(release_answer_lock, session.id, turn.id)
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        background=cleanup,
+    )
 
 
 @router.post("/{session_id}/ask")
@@ -153,6 +211,19 @@ async def get_interview(session_id: int, db: AsyncSession = Depends(get_db)):
 @router.delete("/{session_id}")
 async def delete_interview(session_id: int, db: AsyncSession = Depends(get_db)):
     session = await session_or_404(session_id, db)
+    # These stores are outside the database transaction. Clear them before the
+    # database row, so a transient failure keeps the session available to retry.
+    await retriever.delete_session(session.id)
+    await delete_session_cache(session.id)
     await delete_session_files(session)
-    await db.delete(session); await db.commit()
+    try:
+        # Explicit deletes do not depend on foreign-key cascading being enabled.
+        await db.execute(delete(InterviewQAMessage).where(InterviewQAMessage.session_id == session.id))
+        await db.execute(delete(InterviewSource).where(InterviewSource.session_id == session.id))
+        await db.execute(delete(InterviewTurn).where(InterviewTurn.session_id == session.id))
+        await db.delete(session)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return {"message": "会话已删除"}

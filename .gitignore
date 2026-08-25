@@ -1,7 +1,41 @@
+# Secrets and local configuration
 .env
+.env.*
+!.env.example
+
+# Python / FastAPI
 __pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# User uploads and runtime files
+backend/uploads/
 uploads/
+*.log
+*.sqlite3
+*.db
+
+# Node / Nuxt build output
+frontend/node_modules/
 node_modules/
+frontend/.nuxt/
 .nuxt/
+frontend/.output/
+.output/
 dist/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

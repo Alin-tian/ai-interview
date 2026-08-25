@@ -39,7 +39,11 @@ class MaterialRetriever:
         )
 
     async def embed(self, text: str) -> list[float]:
-        client = AsyncOpenAI(api_key=settings.embedding_api_key, base_url=settings.embedding_base_url)
+        client = AsyncOpenAI(
+            api_key=settings.embedding_api_key,
+            base_url=settings.embedding_base_url,
+            timeout=settings.llm_request_timeout_seconds,
+        )
         result = await client.embeddings.create(model=settings.embedding_model, input=text[:8000])
         return result.data[0].embedding
 
@@ -71,6 +75,21 @@ class MaterialRetriever:
             body = {"size": limit, "query": {"script_score": {"query": base, "script": {"source": "0.3 * _score + 0.7 * (cosineSimilarity(params.vector, 'embedding') + 1.0)", "params": {"vector": vector}}}}}
             response = await es.search(index=INDEX, body=body)
             return [{"source_id": x["_source"]["source_id"], "title": x["_source"]["title"], "content": x["_source"]["content"], "score": x["_score"]} for x in response["hits"]["hits"]]
+        except (ConnectionTimeout, ConnectionError) as exc:
+            raise self.unavailable_error(exc) from exc
+
+    async def delete_session(self, session_id: int) -> None:
+        """Remove every indexed material chunk belonging to one interview session."""
+        try:
+            es = await self._es()
+            if not await es.indices.exists(index=INDEX):
+                return
+            await es.delete_by_query(
+                index=INDEX,
+                query={"term": {"session_id": session_id}},
+                conflicts="proceed",
+                refresh=True,
+            )
         except (ConnectionTimeout, ConnectionError) as exc:
             raise self.unavailable_error(exc) from exc
 

@@ -16,10 +16,47 @@ def _list_of_strings(value) -> list[str]:
         return [str(item) for item in value if isinstance(item, (str, int, float)) and str(item).strip()]
     return []
 
+def _text_or(value, fallback: str) -> str:
+    """Keep user-facing LLM text usable when a model returns malformed JSON."""
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _normalise_evaluation(result: dict, fallback: dict) -> dict:
+    """Prevent malformed model fields from breaking the API consumer."""
+    list_fields = ("evidence_found", "evidence_gaps", "strengths", "missing_points", "factual_errors", "risk_flags")
+    for field in list_fields:
+        result[field] = _list_of_strings(result.get(field)) or fallback.get(field, [])
+    result["improvement_suggestion"] = _text_or(
+        result.get("improvement_suggestion"), fallback["improvement_suggestion"]
+    )
+    return result
+
+def standard_answers(question: dict) -> tuple[str, str]:
+    """Create teachable examples without presenting invented experience as fact."""
+    points = _list_of_strings(question.get("expected_points")) or ["背景与职责", "关键行动", "结果与验证"]
+    evidence = _list_of_strings(question.get("expected_evidence")) or ["具体场景", "个人行动", "可验证结果"]
+    # Model output is not guaranteed to contain multiple list items. Pad the
+    # fields before indexing so a valid single string cannot crash evaluation.
+    points = (points + ["关键行动", "结果与验证"])[:3]
+    evidence = (evidence + ["个人行动", "可验证结果"])[:3]
+    short = (
+        f"示例回答：我会先交代{points[0]}，再说明我如何围绕问题做出关键判断和行动，"
+        f"最后用{evidence[-1]}说明结果，并补充风险控制或复盘。"
+    )
+    full = (
+        "以下是学习用示例，请替换为你自己的真实经历，不能照搬为个人事实。\n"
+        f"1. 背景与目标：说明具体场景、业务目标，以及你承担的职责（重点覆盖：{'、'.join(points[:2])}）。\n"
+        "2. 分析与取舍：说明你识别了什么问题、比较了哪些方案、为何作出当前选择。\n"
+        f"3. 个人行动：按步骤讲清你亲自推进的工作，并给出{evidence[0]}和{evidence[1]}。\n"
+        f"4. 结果与验证：用{evidence[-1]}验证效果，同时说明监控、风险边界或复盘。\n"
+        "示例表述：在【真实场景】中，我负责【个人职责】。为解决【问题】，我先【分析】；比较【方案 A】与【方案 B】后，因【依据】选择【方案】。我具体完成了【行动】，通过【指标/验证方法】确认【结果】；若指标异常，则【风险控制与复盘动作】。"
+    )
+    return short, full
+
 def _normalise_question(value: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]", "", value or "").lower()
 
-def is_similar_question(candidate: str, previous_questions: list[str], threshold: float = 0.72) -> bool:
+def is_similar_question(candidate: str, previous_questions: list[str], threshold: float = 0.70) -> bool:
     candidate = _normalise_question(candidate)
     if not candidate: return True
     for previous in previous_questions:
@@ -85,7 +122,8 @@ def fallback_evaluation(question: dict, answer: str) -> dict:
     relevance = min(25, 10 + sum(term in text for term in _terms(expected, 8)) * 4); evidence_score = 30 if evidence else 10; structure_score = 20 if structure else 8; risk_score = 15 if risk else 5; clarity = 10 if len(text) >= 40 else 4
     score = relevance + evidence_score + structure_score + risk_score + clarity
     dimensions = {"correctness": relevance + 5, "completeness": structure_score + 5, "technical_depth": risk_score + 5, "project_experience": evidence_score, "expression": clarity * 2, "engineering_risk_awareness": risk_score + 5}
-    return {"overall_score": score, "dimensions": dimensions, "dimension_scores": dimensions, "strengths": ["回答包含可识别的经历证据"] if evidence else [], "evidence_found": ["回答中的项目或结果证据"] if evidence else [], "evidence_gaps": [] if evidence else question.get("expected_evidence", []), "missing_points": [] if structure else question.get("expected_points", []), "factual_errors": [], "risk_flags": [] if risk else ["未说明风险或验证方式"], "improvement_suggestion": "请补充真实背景、个人行动、量化结果和验证方式。", "reference_answer": "按背景、行动、取舍、结果、复盘的结构回答。", "source_refs": question.get("source_refs", []), "degraded": True, "next_action": "new_question"}
+    standard_answer_short, standard_answer_full = standard_answers(question)
+    return {"overall_score": score, "dimensions": dimensions, "dimension_scores": dimensions, "strengths": ["回答包含可识别的经历证据"] if evidence else [], "evidence_found": ["回答中的项目或结果证据"] if evidence else [], "evidence_gaps": [] if evidence else question.get("expected_evidence", []), "missing_points": [] if structure else question.get("expected_points", []), "factual_errors": [], "risk_flags": [] if risk else ["未说明风险或验证方式"], "improvement_suggestion": "请补充真实背景、个人行动、量化结果和验证方式。", "standard_answer_short": standard_answer_short, "standard_answer_full": standard_answer_full, "source_refs": question.get("source_refs", []), "degraded": True, "next_action": "new_question"}
 
 def _calibrate_evaluation(result: dict, fallback: dict) -> dict:
     raw = result.get("dimension_scores") or result.get("dimensions") or fallback["dimensions"]
@@ -105,9 +143,13 @@ def _calibrate_evaluation(result: dict, fallback: dict) -> dict:
 
 async def evaluate_answer(question: dict, answer: str) -> dict:
     fallback = fallback_evaluation(question, answer)
-    data = await ask_json("严谨评估候选人回答。区分事实错误、证据不足和合理的不同实现。每项维度 0-100，评分必须与 evidence_found 对应；没有证据不得超过 59 分。只输出 JSON: dimensions,evidence_found,evidence_gaps,strengths,missing_points,factual_errors,risk_flags,improvement_suggestion,reference_answer。", f"问题:{question}\n回答:{answer[:10000]}")
+    data = await ask_json("严谨评估候选人回答。区分事实错误、证据不足和合理的不同实现。每项维度 0-100，评分必须与 evidence_found 对应；没有证据不得超过 59 分。评估后生成两份学习用标准答案：standard_answer_short 为 2-3 句的口述短版；standard_answer_full 为完整结构化示例。不得把虚构项目、指标或经历说成候选人的事实；使用【待替换】占位符，并提醒用户替换为真实经历。只输出 JSON: dimensions,evidence_found,evidence_gaps,strengths,missing_points,factual_errors,risk_flags,improvement_suggestion,standard_answer_short,standard_answer_full。", f"问题:{question}\n回答:{answer[:10000]}")
     if not data: return fallback
-    return _calibrate_evaluation({**fallback, **data, "degraded": False}, fallback)
+    result = _normalise_evaluation({**fallback, **data, "degraded": False}, fallback)
+    result = _calibrate_evaluation(result, fallback)
+    result["standard_answer_short"] = _text_or(data.get("standard_answer_short"), fallback["standard_answer_short"])
+    result["standard_answer_full"] = _text_or(data.get("standard_answer_full"), fallback["standard_answer_full"])
+    return result
 
 async def plan_next(question: dict, evaluation: dict, followups: int, current_round: int, max_rounds: int) -> str:
     if current_round >= max_rounds: return "finish"

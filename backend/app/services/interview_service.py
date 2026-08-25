@@ -58,12 +58,12 @@ async def collect_sources(session: InterviewSession, db: AsyncSession, urls: lis
                 # A search result is still useful and attributable when a site
                 # blocks crawling or returns non-HTML.  Persist Tavily's public
                 # snippet instead of silently dropping the result.
-                snippet = str(result.get("snippet") or "").strip()
-                if snippet:
+                fallback_content = str(result.get("raw_content") or result.get("snippet") or "").strip()
+                if fallback_content:
                     try:
                         added += await add_source(
                             db, session.id, "web_search_result", result.get("title", "公开搜索结果"),
-                            result["url"], snippet, status="summary_only",
+                            result["url"], fallback_content, status="summary_only",
                         )
                     except Exception as save_exc:
                         failures.append(f"保存搜索摘要失败：{save_exc}")
@@ -135,6 +135,20 @@ async def delete_session_files(session: InterviewSession) -> None:
 
 
 async def retrieve_context(session: InterviewSession, db: AsyncSession, query: str) -> list[dict]:
-    hits = await retriever.search(session.id, query)
     source_rows = {x.id: x for x in await sources_for(session.id, db)}
+    try:
+        hits = await retriever.search(session.id, query)
+    except Exception:
+        # Retrieval enriches question generation but must not block the
+        # interview. Fall back to the persisted resume/JD/public materials.
+        return [
+            {
+                "id": source.id,
+                "title": source.title,
+                "content": source.content,
+                "url": source.url,
+                "source_type": source.source_type,
+            }
+            for source in list(source_rows.values())[:5]
+        ]
     return [{"id": x["source_id"], "title": x["title"], "content": x["content"], "url": source_rows.get(x["source_id"]).url if source_rows.get(x["source_id"]) else "", "source_type": "retrieved"} for x in hits]
